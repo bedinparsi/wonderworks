@@ -1,36 +1,49 @@
 #!/usr/bin/env node
 /**
- * WonderWorks AI Content Generator
+ * WonderWorks AI Content Generator (OpenAI)
  *
- * Calls the Claude API to generate brand-new educational content for every
+ * Calls the OpenAI API to generate brand-new educational content for every
  * grade level, then writes content.json / content.js and patches index.html.
  *
+ * Output shape (new):
+ *   { "1": [[20 items], [20 items], ...], "2": [...], ... }
+ * Each grade holds an array of SETS; each set is 20 items.  The SPA picks
+ * a random non-empty set per session.
+ *
  * Setup (one-time):
- *   npm install @anthropic-ai/sdk      (or:  npm init -y && npm i @anthropic-ai/sdk)
- *   export ANTHROPIC_API_KEY=sk-ant-…   (Windows: set ANTHROPIC_API_KEY=sk-ant-…)
+ *   npm install openai
+ *   export OPENAI_API_KEY=sk-…       (Windows PowerShell: $env:OPENAI_API_KEY="sk-…")
+ *                                    (Windows cmd.exe:    set OPENAI_API_KEY=sk-…)
  *
  * Run:
  *   node ai-generate-content.js
  *
  * Optional flags:
- *   --grade 3          Generate only Year 3 (keeps other grades from existing content.json)
- *   --model <id>       Override the Claude model (default: claude-sonnet-4-20250514)
+ *   --grade N          Only Year N (1-6)
+ *   --set K            Only set K (1-based, 1..SETS_PER_GRADE)
+ *   --sets N           How many sets per grade to produce (default 10)
+ *   --model <id>       OpenAI model (default: gpt-4o-mini)
  *   --dry-run          Generate but don't write files
+ *
+ * Notes:
+ *   - One API call per (grade, set).  With defaults that's 6 × 10 = 60 calls.
+ *   - Rejected items (failing anti-leak / validation) trigger an automatic retry
+ *     up to MAX_RETRIES.  See QUALITY RULES in SYSTEM_PROMPT.
  */
 
 // ─── auto-install SDK if missing ────────────────────────────────────────────
 try {
-  require.resolve('@anthropic-ai/sdk');
+  require.resolve('openai');
 } catch (_) {
-  console.log('Installing @anthropic-ai/sdk …');
-  require('child_process').execSync('npm install @anthropic-ai/sdk', {
+  console.log('Installing openai …');
+  require('child_process').execSync('npm install openai', {
     cwd: __dirname, stdio: 'inherit'
   });
 }
 
-const Anthropic = require('@anthropic-ai/sdk');
-const fs   = require('fs');
-const path = require('path');
+const OpenAI = require('openai');
+const fs     = require('fs');
+const path   = require('path');
 
 // ─── configuration ──────────────────────────────────────────────────────────
 const DIR        = __dirname;
@@ -39,58 +52,51 @@ const args       = process.argv.slice(2);
 const flag       = (name) => { const i = args.indexOf('--' + name); return i > -1 ? args[i + 1] : null; };
 const hasFlag    = (name) => args.includes('--' + name);
 
-const MODEL      = flag('model') || 'claude-sonnet-4-20250514';
-const ONLY_GRADE = flag('grade');                       // e.g. "3"
-const DRY_RUN    = hasFlag('dry-run');
-const GRADES     = ONLY_GRADE ? [ONLY_GRADE] : ['1','2','3','4','5','6'];
+const MODEL           = flag('model') || 'gpt-4o-mini';
+const ONLY_GRADE      = flag('grade');
+const ONLY_SET        = flag('set') ? parseInt(flag('set'), 10) : null;   // 1-based
+const SETS_PER_GRADE  = parseInt(flag('sets') || '10', 10);
+const ITEMS_PER_SET   = 20;
+const DRY_RUN         = hasFlag('dry-run');
+const GRADES          = ONLY_GRADE ? [ONLY_GRADE] : ['1','2','3','4','5','6'];
+const SET_INDICES     = ONLY_SET ? [ONLY_SET - 1] : Array.from({length: SETS_PER_GRADE}, (_, i) => i);
 
-// ─── topic distribution (40 slots per grade) ────────────────────────────────
-// Each grade gets the SAME 40 topic/category slots.  The AI fills them at
-// the correct curriculum complexity for the requested year level.
-const TOPIC_SLOTS = [
-  { topic: 'Mathematics',       cat: 'Numbers & Place Value' },
-  { topic: 'Mathematics',       cat: 'Addition' },
-  { topic: 'Mathematics',       cat: 'Subtraction' },
-  { topic: 'Mathematics',       cat: 'Multiplication & Division' },
-  { topic: 'Mathematics',       cat: 'Geometry — 2D Shapes' },
-  { topic: 'Mathematics',       cat: 'Geometry — 3D Shapes & Space' },
-  { topic: 'Mathematics',       cat: 'Measurement — Length' },
-  { topic: 'Mathematics',       cat: 'Measurement — Mass & Capacity' },
-  { topic: 'Mathematics',       cat: 'Patterns & Algebra' },
-  { topic: 'Mathematics',       cat: 'Data & Statistics' },
-  { topic: 'Mathematics',       cat: 'Fractions & Decimals' },
-  { topic: 'Mathematics',       cat: 'Time & Money' },
-  { topic: 'Biology',           cat: 'Animal Classification & Features' },
-  { topic: 'Biology',           cat: 'Animal Life Cycles & Behaviour' },
-  { topic: 'Biology',           cat: 'Plants & Photosynthesis' },
-  { topic: 'Biology',           cat: 'Human Body' },
-  { topic: 'Biology',           cat: 'Ecosystems & Habitats' },
-  { topic: 'Geography',         cat: 'World Geography' },
-  { topic: 'Geography',         cat: 'Australia' },
-  { topic: 'Geography',         cat: 'Maps & Navigation' },
-  { topic: 'Geography',         cat: 'Landforms & Water Systems' },
-  { topic: 'Physics',           cat: 'Forces & Motion' },
-  { topic: 'Physics',           cat: 'Light & Optics' },
-  { topic: 'Physics',           cat: 'Sound & Vibrations' },
-  { topic: 'Physics',           cat: 'Energy' },
-  { topic: 'Physics',           cat: 'Electricity & Magnetism' },
-  { topic: 'Chemistry',         cat: 'States of Matter' },
-  { topic: 'Chemistry',         cat: 'Materials & Properties' },
-  { topic: 'Chemistry',         cat: 'Changes & Reactions' },
-  { topic: 'Ethics',            cat: 'Values & Fairness' },
-  { topic: 'Ethics',            cat: 'Decision Making & Responsibility' },
-  { topic: 'Sociology',         cat: 'Community & Government' },
-  { topic: 'Sociology',         cat: 'Culture & Diversity' },
-  { topic: 'History',           cat: 'Ancient Civilisations' },
-  { topic: 'History',           cat: 'Australian History' },
-  { topic: 'History',           cat: 'World Events & Inventions' },
-  { topic: 'Computer Science',  cat: 'Computers & Hardware' },
-  { topic: 'Computer Science',  cat: 'Coding & Algorithms' },
-  { topic: 'Computer Science',  cat: 'Digital Literacy & AI' },
-  { topic: 'Astronomy',         cat: 'Space & Earth Science' },
-];
+// ─── topic distribution (20 slots per set) ──────────────────────────────────
+// Same 20-slot template for every set; Ethics and Sociology alternate by set index.
+function topicSlotsForSet(setIndex) {
+  const ethicsOrSoc = (setIndex % 2 === 0)
+    ? { topic: 'Ethics',    cat: 'Values & Fairness' }
+    : { topic: 'Sociology', cat: 'Community & Diversity' };
+  return [
+    // Maths (6)
+    { topic: 'Mathematics',       cat: 'Numbers & Place Value' },
+    { topic: 'Mathematics',       cat: 'Addition & Subtraction' },
+    { topic: 'Mathematics',       cat: 'Multiplication & Division' },
+    { topic: 'Mathematics',       cat: 'Geometry & Shapes' },
+    { topic: 'Mathematics',       cat: 'Measurement' },
+    { topic: 'Mathematics',       cat: 'Fractions, Decimals & Data' },
+    // Sciences (6)
+    { topic: 'Biology',           cat: 'Living Things' },
+    { topic: 'Biology',           cat: 'Ecosystems & Adaptation' },
+    { topic: 'Physics',           cat: 'Forces & Energy' },
+    { topic: 'Physics',           cat: 'Light & Sound' },
+    { topic: 'Chemistry',         cat: 'States of Matter' },
+    { topic: 'Chemistry',         cat: 'Materials & Changes' },
+    // Humanities (4)
+    { topic: 'Geography',         cat: 'Places & Maps' },
+    { topic: 'Geography',         cat: 'Environment & Landforms' },
+    { topic: 'History',           cat: 'Australia & The World' },
+    { topic: 'History',           cat: 'Inventions & Ideas' },
+    // Creative / Digital / Society (3)
+    { topic: 'Art',               cat: 'Making & Appreciating Art' },
+    { topic: 'Computer Science',  cat: 'Thinking Like a Computer' },
+    ethicsOrSoc,
+    // Space (1)
+    { topic: 'Astronomy',         cat: 'Our Place in Space' },
+  ];
+}
 
-// Grade-specific maths guidance to ensure curriculum alignment
+// Grade-specific guidance
 const MATH_GUIDANCE = {
   '1': 'Year 1 maths: numbers to 100, place value (tens/ones), addition & subtraction within 20, skip counting by 2s/5s/10s, describing 2D & 3D shape features, measuring with informal units, comparing mass, simple patterns, picture graphs/tally marks, halves & quarters, time to the half-hour, recognising Australian coins.',
   '2': 'Year 2 maths: numbers to 1000, two-digit addition/subtraction, introduction to multiplication as groups, 3D shape faces/edges, symmetry, measuring in cm, kg & L, growing number patterns, simple data tables, unit fractions (1/2, 1/3, 1/4), reading clocks to quarter-hour, adding coins.',
@@ -110,33 +116,36 @@ const TOPIC_COLORS = {
   'Ethics':           '#FDCB6E',
   'Sociology':        '#00CEC9',
   'History':          '#D35400',
+  'Art':              '#FF6B9D',
   'Computer Science': '#0984E3',
   'Astronomy':        '#2C3E50',
 };
 
 const TOPIC_GRADIENTS = {
-  'Mathematics':      ['linear-gradient(135deg,#4A90D9,#6BB9F0)','linear-gradient(135deg,#4A90D9,#74b9ff)','linear-gradient(135deg,#0984e3,#74b9ff)','linear-gradient(135deg,#6c5ce7,#a29bfe)','linear-gradient(135deg,#0984e3,#6c5ce7)','linear-gradient(135deg,#00cec9,#0984e3)','linear-gradient(135deg,#4A90D9,#81ecec)','linear-gradient(135deg,#e17055,#fdcb6e)','linear-gradient(135deg,#4A90D9,#dfe6e9)','linear-gradient(135deg,#fd79a8,#e84393)','linear-gradient(135deg,#00b894,#55efc4)','linear-gradient(135deg,#4A90D9,#a29bfe)'],
-  'Biology':          ['linear-gradient(135deg,#00b894,#55efc4)','linear-gradient(135deg,#00b894,#81ecec)','linear-gradient(135deg,#00b894,#badc58)','linear-gradient(135deg,#a29bfe,#6c5ce7)','linear-gradient(135deg,#00b894,#e17055)'],
-  'Geography':        ['linear-gradient(135deg,#0984e3,#00b894)','linear-gradient(135deg,#e17055,#fdcb6e)','linear-gradient(135deg,#e17055,#fab1a0)','linear-gradient(135deg,#0984e3,#00cec9)'],
-  'Physics':          ['linear-gradient(135deg,#6c5ce7,#a29bfe)','linear-gradient(135deg,#fdcb6e,#f39c12)','linear-gradient(135deg,#6c5ce7,#fd79a8)','linear-gradient(135deg,#fdcb6e,#e17055)','linear-gradient(135deg,#636e72,#b2bec3)'],
-  'Chemistry':        ['linear-gradient(135deg,#0984e3,#00cec9)','linear-gradient(135deg,#e74c3c,#fd79a8)','linear-gradient(135deg,#6c5ce7,#e74c3c)'],
-  'Ethics':           ['linear-gradient(135deg,#fdcb6e,#ffeaa7)','linear-gradient(135deg,#fdcb6e,#00b894)'],
-  'Sociology':        ['linear-gradient(135deg,#00cec9,#81ecec)','linear-gradient(135deg,#e17055,#fdcb6e)'],
-  'History':          ['linear-gradient(135deg,#d35400,#e17055)','linear-gradient(135deg,#d35400,#fdcb6e)','linear-gradient(135deg,#d35400,#e74c3c)'],
-  'Computer Science': ['linear-gradient(135deg,#0984e3,#74b9ff)','linear-gradient(135deg,#0984e3,#00cec9)','linear-gradient(135deg,#0984e3,#6c5ce7)'],
+  'Mathematics':      ['linear-gradient(135deg,#4A90D9,#6BB9F0)','linear-gradient(135deg,#4A90D9,#74b9ff)','linear-gradient(135deg,#0984e3,#74b9ff)','linear-gradient(135deg,#6c5ce7,#a29bfe)','linear-gradient(135deg,#0984e3,#6c5ce7)','linear-gradient(135deg,#00cec9,#0984e3)'],
+  'Biology':          ['linear-gradient(135deg,#00b894,#55efc4)','linear-gradient(135deg,#00b894,#81ecec)'],
+  'Geography':        ['linear-gradient(135deg,#0984e3,#00b894)','linear-gradient(135deg,#e17055,#fdcb6e)'],
+  'Physics':          ['linear-gradient(135deg,#6c5ce7,#a29bfe)','linear-gradient(135deg,#fdcb6e,#f39c12)'],
+  'Chemistry':        ['linear-gradient(135deg,#0984e3,#00cec9)','linear-gradient(135deg,#e74c3c,#fd79a8)'],
+  'Ethics':           ['linear-gradient(135deg,#fdcb6e,#ffeaa7)'],
+  'Sociology':        ['linear-gradient(135deg,#00cec9,#81ecec)'],
+  'History':          ['linear-gradient(135deg,#d35400,#e17055)','linear-gradient(135deg,#d35400,#fdcb6e)'],
+  'Art':              ['linear-gradient(135deg,#ff6b9d,#fdcb6e)'],
+  'Computer Science': ['linear-gradient(135deg,#0984e3,#74b9ff)'],
   'Astronomy':        ['linear-gradient(135deg,#2c3e50,#6c5ce7)'],
 };
 
 const TOPIC_ICONS = {
-  'Mathematics':      ['🔢','➕','➖','✖️','🔷','📦','📏','⚖️','🔄','📊','🍕','🕐'],
-  'Biology':          ['🐾','🦋','🌱','💪','🌿'],
-  'Geography':        ['🌍','🦘','🗺️','🏔️'],
-  'Physics':          ['💪','💡','🔊','⚡','🧲'],
-  'Chemistry':        ['🧊','🧱','🔥'],
-  'Ethics':           ['🤝','💭'],
-  'Sociology':        ['🏘️','🌏'],
-  'History':          ['🏛️','🎨','🚀'],
-  'Computer Science': ['💻','🤖','🛡️'],
+  'Mathematics':      ['🔢','➕','✖️','🔷','📏','🍕'],
+  'Biology':          ['🌱','🦋'],
+  'Geography':        ['🌍','🗺️'],
+  'Physics':          ['⚡','💡'],
+  'Chemistry':        ['🧪','🔥'],
+  'Ethics':           ['🤝'],
+  'Sociology':        ['🏘️'],
+  'History':          ['🏛️','🚀'],
+  'Art':              ['🎨'],
+  'Computer Science': ['💻'],
   'Astronomy':        ['🌙'],
 };
 
@@ -159,85 +168,142 @@ function applyMedia(items) {
   });
 }
 
-// ─── system prompt (cached across all 6 calls) ─────────────────────────────
+// ─── system prompt ──────────────────────────────────────────────────────────
 const SYSTEM_PROMPT = `You are an expert Australian primary-school curriculum designer. Your task is to produce educational content in JSON format for the WonderWorks learning app.
 
-RESPONSE FORMAT — respond with ONLY a raw JSON array.  No markdown fences, no commentary, no text before or after the array.  The response must start with [ and end with ].
+RESPONSE FORMAT — respond with ONLY a raw JSON array. No markdown fences, no commentary, no text before or after the array. The response must start with [ and end with ].
 
-Each element of the array must be an object with exactly these keys:
+Each element must be an object with exactly these keys:
 {
-  "id": <integer 1-40>,
+  "id": <integer 1-20>,
   "topic": "<exact topic string from the list provided>",
   "category": "<subcategory>",
   "title": "<short, engaging title — max 6 words>",
-  "tip": "<2-4 sentences of genuinely educational content: explain a concept, use a vivid analogy or real-world example, age-appropriate vocabulary>",
+  "tip": "<2-4 sentences of genuinely educational content that TEACHES the concept without revealing the specific answer to the question below>",
   "question": {
-    "text": "<clear multiple-choice question that tests understanding of the tip>",
+    "text": "<clear multiple-choice question that tests understanding, NOT recognition of a phrase from the tip>",
     "options": ["<A>","<B>","<C>","<D>"],
     "correct": <0-3 integer index of the correct option>,
     "explanation": "<1-2 sentence explanation of why the correct answer is right>"
   }
 }
 
-QUALITY RULES:
-1. Align content to the AUSTRALIAN CURRICULUM.  Use Australian English ("colour" not "color", "metres" not "meters").  Reference Australian animals, places, sports, and culture where relevant.
-2. Tips must TEACH something concrete — not just name a topic.  Include a fact, formula, analogy, or worked example.
-3. Questions must genuinely test the tip content.  Avoid trivial yes/no questions.  All four options must be plausible.
-4. VARY the correct-answer position across items.  Do NOT cluster correct answers on the same index.
-5. Each tip & question must be UNIQUE and DIFFERENT from common textbook examples.  Be creative.
-6. Never repeat the same concept across items — each of the 40 items covers a distinct idea.
-7. The "id" field must run sequentially from 1 to 40.`;
+CRITICAL ANTI-LEAK RULES — THIS IS THE MOST IMPORTANT CONSTRAINT:
+• The tip must NOT contain the correct answer verbatim, nor a close paraphrase.
+• The tip must NOT solve the exact numeric/worded problem that the question asks.
+  BAD : tip says "15 − 7 = 8", question asks "What is 15 − 7?"
+  GOOD: tip explains the subtraction strategy with DIFFERENT numbers (e.g. 12 − 5), then the question asks "What is 15 − 7?".
+• If the tip uses a worked example, the question MUST use DIFFERENT numbers / different example.
+• If the answer is a key term (e.g. "refraction", "hibernation"), the tip should introduce the concept but NOT state the exact term as the matching label for the question's scenario. Teach the principle; let the student make the connection.
+• Distractors (wrong options) must be plausible — not obviously silly.
 
-// ─── per-grade user prompt ──────────────────────────────────────────────────
-function buildPrompt(grade) {
+OTHER QUALITY RULES:
+1. Align content to the AUSTRALIAN CURRICULUM. Use Australian English ("colour", "metres"). Reference Australian animals, places, and culture where relevant.
+2. Tips must TEACH — include a fact, analogy, or concrete example.
+3. VARY the correct-answer position (do NOT cluster correct answers on the same index).
+4. Each tip & question must be UNIQUE and cover a distinct idea.
+5. The "id" field must run sequentially from 1 to 20.`;
+
+// ─── per-call user prompt ───────────────────────────────────────────────────
+function buildPrompt(grade, setIndex) {
   const ages = { '1':'5-7','2':'6-8','3':'7-9','4':'8-10','5':'9-11','6':'10-12' };
-  const topicList = TOPIC_SLOTS.map((s, i) =>
+  const slots = topicSlotsForSet(setIndex);
+  const topicList = slots.map((s, i) =>
     `${i + 1}. topic="${s.topic}", category="${s.cat}"`
   ).join('\n');
 
-  return `Generate exactly 40 educational items for **Year ${grade}** (ages ${ages[grade]}) in an Australian primary school.
+  return `Generate exactly 20 educational items for **Year ${grade}** (ages ${ages[grade]}) in an Australian primary school.
+
+This is SET ${setIndex + 1} of ${SETS_PER_GRADE} — each set must cover the same curriculum breadth but with FRESH examples, different worked problems, and different question wordings from any other set a student might have seen.
 
 MATHS-SPECIFIC GUIDANCE FOR THIS YEAR LEVEL:
 ${MATH_GUIDANCE[grade]}
 
 NON-MATHS GUIDANCE:
-- Biology, Physics, Chemistry, Geography, History, Ethics, Sociology, Computer Science, and Astronomy content must be calibrated for ages ${ages[grade]}.
+- Biology, Physics, Chemistry, Geography, History, Art, Ethics, Sociology, Computer Science, and Astronomy content must be calibrated for ages ${ages[grade]}.
 - Year ${grade} students ${parseInt(grade) <= 2 ? 'are early readers — use short, clear sentences and concrete examples' : parseInt(grade) <= 4 ? 'can handle moderate vocabulary — use clear explanations with real-world connections' : 'can handle richer vocabulary, abstract reasoning, and multi-step concepts'}.
 
 TOPIC SEQUENCE (each item MUST use the topic and category exactly as listed):
 ${topicList}
 
-Remember: respond with ONLY a JSON array of 40 objects.  Start with [ and end with ].`;
+REMEMBER: the tip must NOT leak the answer. If the question asks "What is 15 − 7?", the tip must teach subtraction WITHOUT computing 15 − 7 anywhere.
+
+Respond with ONLY a JSON array of 20 objects. Start with [ and end with ].`;
+}
+
+// ─── anti-leak post-validation ──────────────────────────────────────────────
+// Normalise: lowercase, strip punctuation, collapse whitespace.
+function norm(s) {
+  return String(s).toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function detectLeak(item) {
+  const tip      = norm(item.tip);
+  const qText    = norm(item.question.text);
+  const correct  = item.question.options[item.question.correct];
+  const ansNorm  = norm(correct);
+
+  // 1. "= <answer>" pattern in tip — classic maths leak.
+  //    Catches "15 − 7 = 8" when answer is "8".
+  const rawTip = String(item.tip);
+  const mathLeak = new RegExp(`=\\s*${ansNorm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(norm(rawTip));
+  if (mathLeak && ansNorm.length > 0) return `tip contains "= ${correct}" (maths answer leaked)`;
+
+  // 2. Answer is a distinctive word/phrase (not "yes/no/true/false/A/B/C/D/a number alone")
+  //    that appears verbatim in the tip.
+  const trivialAnswers = new Set(['yes','no','true','false','a','b','c','d']);
+  if (!trivialAnswers.has(ansNorm) && ansNorm.length >= 4 && !/^\d+(\.\d+)?$/.test(ansNorm)) {
+    if (tip.includes(ansNorm)) return `tip contains answer phrase "${correct}"`;
+  }
+
+  // 3. Question contains the same numeric expression whose result is written in the tip.
+  //    e.g. question "What is 42 − 17?", tip has "42 − 17 = 25".
+  const nums = rawTip.match(/\b\d+\s*[−\-+×x*÷/]\s*\d+\s*=\s*\d+/g);
+  if (nums) {
+    for (const expr of nums) {
+      const lhs = expr.split('=')[0].replace(/\s+/g, '');
+      const qCollapsed = String(item.question.text).replace(/\s+/g, '');
+      if (qCollapsed.includes(lhs)) return `tip solves "${expr.trim()}" which matches the question`;
+    }
+  }
+
+  return null;
 }
 
 // ─── API call with retry ────────────────────────────────────────────────────
-async function callAPI(client, grade, attempt = 1) {
+async function callAPI(client, grade, setIndex, attempt = 1) {
   const MAX_RETRIES = 3;
   try {
-    const response = await client.messages.create({
+    const resp = await client.chat.completions.create({
       model: MODEL,
-      max_tokens: 16384,
-      system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
-      messages: [{ role: 'user', content: buildPrompt(grade) }],
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user',   content: buildPrompt(grade, setIndex) },
+      ],
+      temperature: 0.8,
+      max_tokens: 8000,
+      response_format: { type: 'json_object' },
     });
 
-    // Extract text
-    let text = response.content
-      .filter(b => b.type === 'text')
-      .map(b => b.text)
-      .join('');
+    let text = (resp.choices?.[0]?.message?.content || '').trim();
 
-    // Strip code fences if the model wrapped the JSON
-    text = text.trim();
+    // Some models (with json_object mode) wrap the array in an object like {"items":[...]} —
+    // try to unwrap.  Otherwise expect a raw array inside JSON (rare: the model may wrap in fences).
     if (text.startsWith('```')) {
       text = text.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
     }
 
-    const items = JSON.parse(text);
-
-    // Validate
+    let parsed = JSON.parse(text);
+    let items = Array.isArray(parsed) ? parsed : (parsed.items || parsed.questions || parsed.data);
+    if (!Array.isArray(items)) {
+      // Last-ditch: if it's an object whose values are the items, take the values.
+      const vals = Object.values(parsed);
+      if (vals.length && typeof vals[0] === 'object' && vals[0].topic) items = vals;
+    }
     if (!Array.isArray(items)) throw new Error('Response is not an array');
-    if (items.length !== 40)   throw new Error(`Expected 40 items, got ${items.length}`);
+    if (items.length !== ITEMS_PER_SET) throw new Error(`Expected ${ITEMS_PER_SET} items, got ${items.length}`);
+
+    // Shape validation
     items.forEach((it, i) => {
       if (!it.topic || !it.title || !it.tip || !it.question)
         throw new Error(`Item ${i + 1} missing required fields`);
@@ -245,51 +311,52 @@ async function callAPI(client, grade, attempt = 1) {
         throw new Error(`Item ${i + 1}: question must have exactly 4 options`);
       if (typeof it.question.correct !== 'number' || it.question.correct < 0 || it.question.correct > 3)
         throw new Error(`Item ${i + 1}: correct must be 0-3`);
-      // Normalise id
       it.id = i + 1;
     });
 
-    // Log token usage
-    const usage = response.usage || {};
-    const cached = usage.cache_read_input_tokens || 0;
-    console.log(` ${items.length} items | tokens: ${usage.input_tokens || '?'} in (${cached} cached) / ${usage.output_tokens || '?'} out`);
+    // Anti-leak validation
+    const leaks = [];
+    items.forEach((it, i) => {
+      const why = detectLeak(it);
+      if (why) leaks.push(`  #${i + 1} (${it.topic}/${it.category}): ${why}`);
+    });
+    if (leaks.length > 0) {
+      throw new Error(`${leaks.length} item(s) leak the answer:\n${leaks.join('\n')}`);
+    }
 
+    const usage = resp.usage || {};
+    console.log(` ${items.length} items | tokens: ${usage.prompt_tokens || '?'} in / ${usage.completion_tokens || '?'} out`);
     return items;
 
   } catch (err) {
     if (attempt < MAX_RETRIES) {
-      console.log(` attempt ${attempt} failed (${err.message}), retrying…`);
+      console.log(`\n    attempt ${attempt} failed: ${err.message}\n    retrying…`);
       await new Promise(r => setTimeout(r, 2000 * attempt));
-      return callAPI(client, grade, attempt + 1);
+      return callAPI(client, grade, setIndex, attempt + 1);
     }
-    throw new Error(`Year ${grade} failed after ${MAX_RETRIES} attempts: ${err.message}`);
+    throw new Error(`Year ${grade} Set ${setIndex + 1} failed after ${MAX_RETRIES} attempts: ${err.message}`);
   }
 }
 
-// ─── file writers (same logic as generate-content.js) ───────────────────────
+// ─── file writers ───────────────────────────────────────────────────────────
 function writeFiles(content) {
   const json = JSON.stringify(content, null, 2);
 
-  // 1. content.json
   fs.writeFileSync(file('content.json'), json, 'utf8');
   console.log(`  Wrote content.json  (${(Buffer.byteLength(json) / 1024).toFixed(0)} KB)`);
 
-  // 2. content.js
   const js = `const CONTENT = ${json};\n`;
   fs.writeFileSync(file('content.js'), js, 'utf8');
   console.log(`  Wrote content.js   (${(Buffer.byteLength(js) / 1024).toFixed(0)} KB)`);
 
-  // 3. index.html (marker-based replacement)
   const htmlPath = file('index.html');
   if (!fs.existsSync(htmlPath)) { console.warn('  index.html not found — skipped'); return; }
-
   let html = fs.readFileSync(htmlPath, 'utf8');
   const S = '/* __CONTENT_START__ */';
   const E = '/* __CONTENT_END__ */';
   const si = html.indexOf(S);
   const ei = html.indexOf(E);
   if (si === -1 || ei === -1) { console.error('  Markers missing in index.html — skipped'); return; }
-
   html = html.slice(0, si + S.length) + '\nconst CONTENT = ' + json + ';\n' + html.slice(ei);
   fs.writeFileSync(htmlPath, html, 'utf8');
   console.log(`  Updated index.html (${(Buffer.byteLength(html) / 1024).toFixed(0)} KB)`);
@@ -298,43 +365,62 @@ function writeFiles(content) {
 // ─── main ───────────────────────────────────────────────────────────────────
 async function main() {
   console.log();
-  console.log('  WonderWorks AI Content Generator');
-  console.log('  ================================');
+  console.log('  WonderWorks AI Content Generator (OpenAI)');
+  console.log('  =========================================');
   console.log(`  Model : ${MODEL}`);
   console.log(`  Grades: ${GRADES.join(', ')}`);
+  console.log(`  Sets  : ${SET_INDICES.map(i => i + 1).join(', ')}  (of ${SETS_PER_GRADE})`);
+  console.log(`  Items : ${ITEMS_PER_SET} per set`);
+  console.log(`  Total : ${GRADES.length * SET_INDICES.length} API call(s)`);
   console.log();
 
-  if (!process.env.ANTHROPIC_API_KEY) {
-    console.error('  ERROR: ANTHROPIC_API_KEY environment variable is not set.');
-    console.error('  Set it with:  export ANTHROPIC_API_KEY=sk-ant-…');
-    console.error('  (Windows:     set ANTHROPIC_API_KEY=sk-ant-…  )');
+  if (!process.env.OPENAI_API_KEY) {
+    console.error('  ERROR: OPENAI_API_KEY environment variable is not set.');
+    console.error('  PowerShell: $env:OPENAI_API_KEY="sk-…"');
+    console.error('  cmd.exe:    set OPENAI_API_KEY=sk-…');
+    console.error('  bash:       export OPENAI_API_KEY=sk-…');
     process.exit(1);
   }
 
-  const client = new Anthropic();
+  const client = new OpenAI();
 
-  // Load existing content so we can keep grades we're not regenerating
+  // Load existing content — we PRESERVE whatever isn't being regenerated.
   let content = {};
   if (fs.existsSync(file('content.json'))) {
     try { content = JSON.parse(fs.readFileSync(file('content.json'), 'utf8')); } catch (_) {}
   }
+  // Migrate legacy flat shape → nested sets if needed.
+  for (const g of ['1','2','3','4','5','6']) {
+    if (Array.isArray(content[g]) && content[g].length > 0 && !Array.isArray(content[g][0])) {
+      console.log(`  Migrating legacy flat shape for Year ${g} → 1 set`);
+      content[g] = [content[g]];
+    }
+  }
+  // Ensure each grade is an array sized for SETS_PER_GRADE (pad with nulls).
+  for (const g of GRADES) {
+    if (!Array.isArray(content[g])) content[g] = [];
+    while (content[g].length < SETS_PER_GRADE) content[g].push(null);
+  }
 
   const t0 = Date.now();
   for (const grade of GRADES) {
-    process.stdout.write(`  Year ${grade} …`);
-    const start = Date.now();
-    const items = await callAPI(client, grade);
-    applyMedia(items);
-    content[grade] = items;
-    const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-    console.log(`         (${elapsed}s)`);
+    for (const setIdx of SET_INDICES) {
+      process.stdout.write(`  Year ${grade} / Set ${setIdx + 1} …`);
+      const start = Date.now();
+      const items = await callAPI(client, grade, setIdx);
+      applyMedia(items);
+      content[grade][setIdx] = items;
+      const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+      console.log(`         (${elapsed}s)`);
+    }
   }
   const totalTime = ((Date.now() - t0) / 1000).toFixed(1);
   console.log();
 
   if (DRY_RUN) {
     console.log('  --dry-run: skipping file writes');
-    console.log('  Sample Year ' + GRADES[0] + ' item 1:', JSON.stringify(content[GRADES[0]][0], null, 2).slice(0, 300) + '…');
+    const g = GRADES[0], s = SET_INDICES[0];
+    console.log(`  Sample Year ${g} Set ${s+1} item 1:`, JSON.stringify(content[g][s][0], null, 2).slice(0, 300) + '…');
   } else {
     writeFiles(content);
   }
@@ -343,17 +429,12 @@ async function main() {
   console.log();
   console.log('  Summary');
   console.log('  -------');
-  const topics = new Set();
-  let total = 0;
-  for (const [g, items] of Object.entries(content)) {
-    items.forEach(i => topics.add(i.topic));
-    total += items.length;
-    // Check answer distribution
-    const dist = [0, 0, 0, 0];
-    items.forEach(i => dist[i.question.correct]++);
-    console.log(`  Year ${g}: ${items.length} items  (answer spread: A=${dist[0]} B=${dist[1]} C=${dist[2]} D=${dist[3]})`);
+  for (const g of ['1','2','3','4','5','6']) {
+    const sets = content[g] || [];
+    const populated = sets.filter(s => Array.isArray(s) && s.length > 0).length;
+    console.log(`  Year ${g}: ${populated}/${SETS_PER_GRADE} sets populated`);
   }
-  console.log(`  Total : ${total} items across ${topics.size} subjects in ${totalTime}s`);
+  console.log(`  Wall time : ${totalTime}s`);
   console.log();
 }
 
