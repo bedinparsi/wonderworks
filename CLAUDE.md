@@ -231,6 +231,60 @@ Astronomy: #2C3E50
 
 ---
 
+## Content Authoring Rule — No Example Overlap
+
+**The single most important rule when writing or regenerating content.**
+
+The tip must TEACH a technique or concept using one set of examples. The
+question must TEST that technique or concept using a DIFFERENT set of examples.
+A student should have to APPLY what they just read, not parrot a specific
+worked example.
+
+Concretely:
+
+1. **Numbers used in the tip's worked example must NOT appear in the question.**
+   - BAD: tip says "367 → round UP to 400", question asks "Round 367 to the nearest hundred."
+   - GOOD: tip uses 485 and 231 as examples, question asks about 367.
+
+2. **The answer must not appear verbatim in the tip.**
+   - BAD: tip says "Bears hibernate through winter", question asks "What do bears do in winter?" with answer "Hibernate".
+   - GOOD: tip explains the concept ("some animals enter a deep winter sleep to save energy"), question asks for the name of that behaviour.
+
+3. **Entity overlap** — named animals, places, people, objects used as the tip's
+   concrete example must not also be the subject of the question.
+   - BAD: tip describes polar bears' thick fur; question asks why polar bears have thick fur.
+   - GOOD: tip describes adaptation generally with polar-bear example; question asks about desert camels.
+
+Both `ai-generate-content.js` (in `SYSTEM_PROMPT` and `detectLeak()`) and any
+hand-written content MUST respect this rule. The validator rejects items where
+numbers of 2+ digits appear in both tip and question, or where the answer
+phrase appears in the tip — retry until clean.
+
+---
+
+## Data shape — sets of 20
+
+Content is organised as **10 sets × 20 items per grade** (6 grades → 1,200 items total).
+
+```
+content.json: { "1": [[20 items], [20 items], ...], "2": [...], ... }
+```
+
+The SPA picks a random populated set on start (`populatedSetIndices()` in
+index.html). `state.setIndex` is stored in the in-progress localStorage save,
+so resume restores the correct set. Legacy flat saves without `setIndex` are
+treated as incompatible and ignored.
+
+Per-set topic distribution (20 slots):
+- Mathematics × 6 (Numbers, Add/Sub, Mul/Div, Geometry, Measurement, Fractions/Decimals/Data)
+- Biology × 2, Physics × 2, Chemistry × 2
+- Geography × 2, History × 2
+- Art × 1, Computer Science × 1
+- Ethics (even sets) or Sociology (odd sets) × 1
+- Astronomy × 1
+
+---
+
 ## Gotchas & Things to Watch
 
 1. **Exit code 1 from Bash on this machine** — Mo's Windows setup has a sandbox temp-file
@@ -293,3 +347,20 @@ These are ideas that came up during development or that Mo might request:
 - Git: repo exists with at least one commit (`2037126 Initial commit`)
 - Branch: `master` (main branch is `main`)
 - The `WonderWorks/` folder is a subfolder of the `mo` repo
+
+---
+
+## Working Conventions (for Claude)
+
+**Autonomy inside the project folder.** Mo has granted Claude broad
+read/write/execute permission within this project directory via
+`.claude/settings.local.json`. Don't ask for confirmation on routine
+project-scoped actions (edits, bash commands, generator runs). Still confirm
+for anything outside the project or anything destructive at repo scope (e.g.
+`git push --force`, mass deletions outside `temp/`).
+
+**Temp files go in `./temp/`, not system temp.** When a scratch file, extract,
+or one-off script is needed, create `./temp/` at the project root (if it
+doesn't exist) and work there. Clean up `./temp/` contents when the task
+finishes — leave the folder empty (or remove it). Never use `/tmp`, `C:\tmp`,
+or `%TEMP%` for this project. `temp/` is already in .gitignore.

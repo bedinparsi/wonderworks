@@ -193,9 +193,15 @@ CRITICAL ANTI-LEAK RULES — THIS IS THE MOST IMPORTANT CONSTRAINT:
 • The tip must NOT solve the exact numeric/worded problem that the question asks.
   BAD : tip says "15 − 7 = 8", question asks "What is 15 − 7?"
   GOOD: tip explains the subtraction strategy with DIFFERENT numbers (e.g. 12 − 5), then the question asks "What is 15 − 7?".
-• If the tip uses a worked example, the question MUST use DIFFERENT numbers / different example.
+• **NO NUMBER OVERLAP**: any multi-digit number (10, 25, 367, 4.8, etc.) that appears in the tip's worked example MUST NOT appear anywhere in the question text or options.
+  BAD : tip says "367 → round UP to 400", question asks "Round 367 to the nearest hundred."
+  GOOD: tip uses 485 and 231 as its rounding examples; question asks about 367.
+• **NO ENTITY OVERLAP**: named animals, places, people, or objects used as the tip's illustrative example must not also be the subject of the question.
+  BAD : tip describes how polar bears have thick fur; question asks "Why do polar bears have thick fur?"
+  GOOD: tip describes adaptation with the polar-bear example; question asks about camels, koalas, or penguins.
 • If the answer is a key term (e.g. "refraction", "hibernation"), the tip should introduce the concept but NOT state the exact term as the matching label for the question's scenario. Teach the principle; let the student make the connection.
 • Distractors (wrong options) must be plausible — not obviously silly.
+• Test APPLICATION, not recognition. A student who only memorises phrases from the tip must still get the question wrong; a student who UNDERSTANDS the concept gets it right.
 
 OTHER QUALITY RULES:
 1. Align content to the AUSTRALIAN CURRICULUM. Use Australian English ("colour", "metres"). Reference Australian animals, places, and culture where relevant.
@@ -237,33 +243,57 @@ function norm(s) {
   return String(s).toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
+// Extract all numbers (integers and decimals) of 2+ characters from text.
+// "367", "4.8", "25" → yes; "5", "3" → no.
+function extractMultiDigitNumbers(s) {
+  const out = new Set();
+  const re = /\b\d+(?:\.\d+)?\b/g;
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    if (m[0].length >= 2) out.add(m[0]);  // "10" qualifies, "4.8" qualifies, "5" doesn't
+  }
+  return out;
+}
+
 function detectLeak(item) {
   const tip      = norm(item.tip);
   const qText    = norm(item.question.text);
   const correct  = item.question.options[item.question.correct];
   const ansNorm  = norm(correct);
+  const rawTip   = String(item.tip);
 
-  // 1. "= <answer>" pattern in tip — classic maths leak.
-  //    Catches "15 − 7 = 8" when answer is "8".
-  const rawTip = String(item.tip);
-  const mathLeak = new RegExp(`=\\s*${ansNorm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(norm(rawTip));
-  if (mathLeak && ansNorm.length > 0) return `tip contains "= ${correct}" (maths answer leaked)`;
+  // 1. "= <answer>" or "answer: <answer>" pattern in tip — classic maths leak.
+  const ansEsc = ansNorm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (ansNorm.length > 0) {
+    if (new RegExp(`=\\s*${ansEsc}\\b`).test(tip)) return `tip contains "= ${correct}" (maths answer leaked)`;
+    if (new RegExp(`\\banswer\\s*(is|:)?\\s*${ansEsc}\\b`).test(tip)) return `tip states "answer is ${correct}"`;
+  }
 
-  // 2. Answer is a distinctive word/phrase (not "yes/no/true/false/A/B/C/D/a number alone")
-  //    that appears verbatim in the tip.
+  // 2. Answer is a distinctive word/phrase that appears verbatim in the tip.
   const trivialAnswers = new Set(['yes','no','true','false','a','b','c','d']);
   if (!trivialAnswers.has(ansNorm) && ansNorm.length >= 4 && !/^\d+(\.\d+)?$/.test(ansNorm)) {
     if (tip.includes(ansNorm)) return `tip contains answer phrase "${correct}"`;
   }
 
-  // 3. Question contains the same numeric expression whose result is written in the tip.
-  //    e.g. question "What is 42 − 17?", tip has "42 − 17 = 25".
-  const nums = rawTip.match(/\b\d+\s*[−\-+×x*÷/]\s*\d+\s*=\s*\d+/g);
-  if (nums) {
-    for (const expr of nums) {
-      const lhs = expr.split('=')[0].replace(/\s+/g, '');
-      const qCollapsed = String(item.question.text).replace(/\s+/g, '');
-      if (qCollapsed.includes(lhs)) return `tip solves "${expr.trim()}" which matches the question`;
+  // 3. Question expression (lhs) appears in tip with an '=' nearby.
+  const numExprs = rawTip.match(/\b\d+\s*[−\-+×x*÷/]\s*\d+/g) || [];
+  for (const e of numExprs) {
+    const lhsNoSpace = e.replace(/\s+/g, '');
+    const qNoSpace = String(item.question.text).replace(/\s+/g, '');
+    if (qNoSpace.includes(lhsNoSpace) && /=\s*\d/.test(rawTip)) {
+      return `tip contains question expression "${e}" followed by =`;
+    }
+  }
+
+  // 4. NO NUMBER OVERLAP: any 2+ digit number in the tip that also appears in the
+  //    question text or options is a leak — the tip's worked example must use
+  //    different numbers from the question.
+  const tipNums = extractMultiDigitNumbers(rawTip);
+  if (tipNums.size > 0) {
+    const qBlob = String(item.question.text) + ' ' + item.question.options.join(' ');
+    const qNums = extractMultiDigitNumbers(qBlob);
+    for (const n of tipNums) {
+      if (qNums.has(n)) return `number "${n}" appears in both tip and question — tip must use different example numbers`;
     }
   }
 
